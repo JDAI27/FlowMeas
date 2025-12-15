@@ -1,0 +1,10 @@
+
+torch
+numpy
+scipy
+matplotlib
+pandas
+psutil
+pyscf>=2.3.0
+openfermion>=1.5.1
+stim

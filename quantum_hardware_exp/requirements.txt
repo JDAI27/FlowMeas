@@ -1,0 +1,6 @@
+# Core requirements
+qiskit>=1.0.0
+qiskit-ibm-runtime>=0.20.0
+numpy>=1.24.0
+torch>=2.0.0
+scipy>=1.10.0

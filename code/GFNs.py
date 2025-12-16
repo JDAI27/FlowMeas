@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
+# GFNs.py
+
 import os
 import json
 import heapq
 import torch
 import logging
 
+# Enable TensorFloat32 for better performance on Ampere and newer GPUs
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
 from torch.distributions import Categorical
@@ -19,7 +22,7 @@ import torch.nn.functional as F
 
 try:
     from torch.profiler import record_function as torch_record_function
-except ImportError:
+except ImportError:  # pragma: no cover - torch profiler optional
     def torch_record_function(_name):
         @contextmanager
         def _noop():
@@ -28,6 +31,7 @@ except ImportError:
 
 record_function = torch_record_function
 
+# Configure logging to show debug messages when debug mode is enabled
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -42,6 +46,7 @@ try:
     from .quantum_action_mapping import build_action_mapping
     from .masking_engine import MaskingEngine
 except ImportError:
+    # Fallback to absolute imports for direct execution
     from clifford_map import CliffordMap
     from models import DiscreteUniform, CliffordMLP, QuantumAwareMLP, AttentionMLP, create_clifford_model, CliffordTableauProcessor
     from gfn_objectives import GFlowNetObjective, create_gfn_objective
@@ -87,6 +92,7 @@ def default_reward_fn(costs: torch.Tensor, beta: float = 1.0, alpha: float = 5e-
 
 def log_reward_fn(costs: torch.Tensor, beta: float = 1.0, alpha: float = 1.0, **kwargs) -> torch.Tensor:
     """Logarithmic reward function for stronger differentiation."""
+    # Avoid log(0) by adding a small epsilon
     epsilon = 1e-8
     return -beta * torch.log(alpha * costs + epsilon)
 
@@ -124,34 +130,47 @@ class AdaptiveBufferTracker:
         self.initial_buffer_size = initial_buffer_size
         self.warmup_updates = warmup_updates
         
+        # Track statistics across trajectories
         self.gates_per_depth = defaultdict(list)
         self.buffer_utilization = []
         self.depth_distribution = defaultdict(int)
         
+        # Running statistics (kept on GPU for efficiency)
         self.max_gates_seen = torch.tensor(0, device=device)
         self.total_trajectories = 0
         self.update_count = 0
         
-        self.gate_counts = []
+        # Percentile tracking for robust estimation
+        self.gate_counts = []  # All observed gate counts
         
     def update_statistics(self, trajectory_batch):
         """Update statistics from a batch of trajectories."""
+        batch_size = trajectory_batch.batch_size
+        n_measurements = trajectory_batch.n_measurements
+        
+        # GPU OPTIMIZATION: Vectorized processing instead of nested Python loops
+        # Get valid trajectories (lengths > 0)
         valid_mask = trajectory_batch.lengths > 0
         valid_depths = trajectory_batch.circuit_depths[valid_mask]
         valid_gates = trajectory_batch.lengths[valid_mask]
         
         if valid_gates.numel() > 0:
+            # Single CPU transfer for all valid data
             depths_cpu = valid_depths.cpu().tolist()
             gates_cpu = valid_gates.cpu().tolist()
             
+            # Process transferred data
             for depth, gates in zip(depths_cpu, gates_cpu):
                 self.gates_per_depth[depth].append(gates)
                 self.gate_counts.append(gates)
                 self.depth_distribution[depth] += 1
             
             self.total_trajectories += len(gates_cpu)
+            
+            # Update max gates seen (keep on GPU)
             self.max_gates_seen = torch.max(self.max_gates_seen, valid_gates.max())
         
+        # Update buffer utilization
         max_used = trajectory_batch.lengths.max()
         utilization = max_used.float() / trajectory_batch.max_length
         self.buffer_utilization.append(utilization.item())
@@ -160,24 +179,37 @@ class AdaptiveBufferTracker:
         
     def get_recommended_buffer_size(self, max_depth: int, percentile: float = 95.0) -> int:
         """Get recommended buffer size based on statistics."""
+        # During warmup, return initial size
         if self.update_count < self.warmup_updates:
             return self.initial_buffer_size
         
+        # If we have data for this specific depth
         if max_depth in self.gates_per_depth and len(self.gates_per_depth[max_depth]) >= 20:
             gates_at_depth = self.gates_per_depth[max_depth]
             gates_tensor = torch.tensor(gates_at_depth, device=self.device, dtype=torch.float32)
             recommended = torch.quantile(gates_tensor, percentile / 100.0).item()
+        
+        # Otherwise, use all data with scaling
         elif len(self.gate_counts) >= 100:
             all_gates = torch.tensor(self.gate_counts, device=self.device, dtype=torch.float32)
             base_percentile = torch.quantile(all_gates, percentile / 100.0).item()
+            
+            # Scale based on depth ratio
             avg_depth = sum(d * count for d, count in self.depth_distribution.items()) / self.total_trajectories
             depth_ratio = max_depth / max(avg_depth, 1.0)
             recommended = base_percentile * depth_ratio
+        
         else:
+            # Not enough data, use conservative estimate with slight reduction
             recommended = self.initial_buffer_size * 0.8
         
+        # Ensure we have some headroom (10% safety margin)
         recommended = int(recommended * 1.1)
+        
+        # Never go below 50% of initial conservative estimate
         min_size = int(self.initial_buffer_size * 0.5)
+        
+        # Never exceed initial conservative estimate
         return max(min_size, min(recommended, self.initial_buffer_size))
     
     def get_statistics_summary(self) -> Dict:
@@ -207,6 +239,7 @@ class TrajectoryBatch:
         self.n_qubits = n_qubits
         self.device = device
         
+        # Keep all tensors on GPU
         self.actions = torch.zeros((batch_size, n_measurements, max_length), 
                                     dtype=torch.long, device=device)
         self.lengths = torch.zeros((batch_size, n_measurements), 
@@ -216,30 +249,43 @@ class TrajectoryBatch:
         self.masks = torch.ones((batch_size, n_measurements, max_length), 
                                 dtype=torch.bool, device=device)
         
+        # Circuit depth tracking
         self.circuit_depths = torch.zeros((batch_size, n_measurements), 
                                          dtype=torch.long, device=device)
+        
+        # Track which qubits are occupied in the current layer
         self.current_layer_qubits = torch.zeros((batch_size, n_measurements, n_qubits), 
                                                dtype=torch.bool, device=device)
+        
+        # Track the last layer where each qubit was used
         self.qubit_last_layer = torch.zeros((batch_size, n_measurements, n_qubits), 
                                            dtype=torch.long, device=device) - 1
         
+        # Gate tracking
         self.last_single_qubit_gates = torch.zeros((batch_size, n_measurements, n_qubits), 
                                                     dtype=torch.long, device=device) - 1
         self.last_two_qubit_gates = torch.zeros((batch_size, n_measurements, n_qubits, n_qubits), 
                                                 dtype=torch.long, device=device) - 1
+        
+        # Track which step each qubit was last used (for backward policy)
         self.qubit_last_use_step = torch.full((batch_size, n_measurements, n_qubits), 
                                               -1, dtype=torch.long, device=device)
+        
+        # Track action history with qubit info for exposed gate computation
         self.action_qubits = torch.full((batch_size, n_measurements, max_length, 2), 
-                                        -1, dtype=torch.long, device=device)
+                                        -1, dtype=torch.long, device=device)  # -1 for unused
         
         self.batched_tableau = None
         
-        self.cached_states = []
-        self.cached_masks = []
-        self.cached_backward_valid_counts = []
-        self.cache_enabled = False
+        # State caching for flow computation
+        self.cached_states = []  # List of (states_tensor, indices) for each step
+        self.cached_masks = []  # Action masks for each step
+        self.cached_backward_valid_counts = []  # Number of valid backward actions for each step
+        self.cache_enabled = False  # Flag to control caching
         
-        # Double-buffered pre-allocation for flow computation
+        # GPU OPTIMIZATION: Double-buffered pre-allocation to avoid repeated allocations while
+        # maintaining safety (previous results survive at least one more call).
+        # This is a classic GPU optimization pattern that eliminates buffer aliasing issues.
         self._flow_buffer_idx = 0
         self._forward_flows_buffers = [
             torch.zeros((batch_size, n_measurements), device=device),
@@ -268,12 +314,14 @@ class TrajectoryBatch:
         """Cache state data for a specific step during sampling."""
         if not self.cache_enabled:
             return
-        
+            
+        # Ensure we have enough slots
         while len(self.cached_states) <= step:
             self.cached_states.append(None)
             self.cached_masks.append(None)
             self.cached_backward_valid_counts.append(None)
         
+        # Convert indices to tensor if needed
         if isinstance(indices, list):
             indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
         else:
@@ -282,6 +330,7 @@ class TrajectoryBatch:
         self.cached_states[step] = (states_tensor.clone(), indices_tensor)
         self.cached_masks[step] = masks.clone()
         
+        # Cache backward valid counts if provided
         if backward_valid_counts is not None:
             self.cached_backward_valid_counts[step] = backward_valid_counts.clone()
         
@@ -334,24 +383,35 @@ class GFlowNet:
                 debug: bool = False,
                 device_preference: Optional[str] = None,
                 K: int = 5,
-                buffer_strategy: str = 'conservative',
+                buffer_strategy: str = 'conservative',  # Default to conservative
                 adaptive_warmup: int = 100):
         
+        # Store buffer strategy
         self.buffer_strategy = buffer_strategy
         self.adaptive_warmup = adaptive_warmup
-        self.conservative_multiplier = 1.2
+        
+        # Initialize conservative bound calculator
+        self.conservative_multiplier = 1.2  # 20% safety margin
+        
+        # Initialize adaptive tracker if needed
         self.adaptive_tracker = None
+        if self.buffer_strategy == 'adaptive':
+            # Will be initialized when we know max_depth
+            pass
         
         self.n_qubits = n_qubits
         self.device = device or get_device(device_preference)
         self.model_type = model_type
         self.debug = debug
         
+        # Set logging level based on debug flag
         if self.debug:
             logging.getLogger().setLevel(logging.DEBUG)
         
         logging.info(f"Using device: {self.device}")
         logging.info(f"Buffer strategy: {self.buffer_strategy}")
+        if self.debug:
+            logging.debug(f"Debug mode enabled")
         
         self.reward_fn = reward_fn or default_reward_fn
         
@@ -362,10 +422,13 @@ class GFlowNet:
         self.action_mapping = self._build_action_mapping()
         self.num_actions = len(self.action_mapping)
         
+        # Pre-compute gate info first (needed by _precompute_gate_indices)
         self._precompute_gate_info()
+        
+        # Pre-compute gate type indices for GPU operations
         self._precompute_gate_indices()
         
-        self.state_dim = (2 * n_qubits) ** 2
+        self.state_dim = (2 * n_qubits) ** 2  # Only W matrix (2nx2n Clifford tableau), no phase vector
         
         model_kwargs = model_kwargs or {}
         
@@ -382,6 +445,7 @@ class GFlowNet:
 
         self._init_model_weights()
 
+        # Setup optimizer based on model type
         if hasattr(self.pf_model, 'logZ'):
             self.optimizer = torch.optim.Adam([
                 {'params': self.pf_model.logZ, 'lr': 100*lr},
@@ -389,26 +453,45 @@ class GFlowNet:
                  'lr': lr , 'weight_decay': weight_decay}
             ])
         else:
+            # For models without logZ (like DiscreteUniform)
+            # Check if model has any parameters
             params = list(self.pf_model.parameters())
             if params:
-                self.optimizer = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+                self.optimizer = torch.optim.Adam(
+                    params, 
+                    lr=lr, 
+                    weight_decay=weight_decay
+                )
             else:
+                # No parameters to optimize (e.g., DiscreteUniform)
+                # Create a dummy optimizer with no parameters
                 self.optimizer = None
         
-        self.grad_clip_value = 1e3
+        self.grad_clip_value = 1e3  # Gradient clipping value
 
+        # Apply torch.compile for GPU optimization (PyTorch 2.0+) AFTER optimizer setup
         if torch.__version__ >= '2.0.0' and self.device.type in ['cuda', 'mps']:
             try:
-                compile_options = {'mode': 'reduce-overhead', 'fullgraph': False}
+                # Configure compile options for better performance
+                compile_options = {
+                    'mode': 'reduce-overhead',
+                    'fullgraph': False  # Allow better handling of dynamic shapes
+                }
                 if self.device.type == 'cuda':
+                    # Set CUDAGraph options to handle dynamic shapes better
                     import torch._inductor.config as config
-                    config.triton.cudagraph_trees = True
+                    config.triton.cudagraph_trees = True  # Use tree-based CUDAGraphs
+                    # Option 1: Skip dynamic graphs to avoid overhead (recommended for many shapes)
                     config.triton.cudagraph_skip_dynamic_graphs = True
+                    # Option 2: Increase warning limit (comment out above and use this instead)
+                    # config.triton.cudagraph_dynamic_shape_warn_limit = None  # Silence warnings
+
                 self.pf_model = torch.compile(self.pf_model, **compile_options)
                 logging.info(f"Applied torch.compile optimization to forward model")
             except Exception as e:
                 logging.warning(f"torch.compile not applied: {e}")
 
+        # Store top trajectories as tensors to avoid CPU transfer
         self.top_trajectories_actions = []
         self.top_trajectories_lengths = []
         self.top_trajectories_rewards = []
@@ -434,33 +517,38 @@ class GFlowNet:
         return actions
 
     def _precompute_gate_info(self):
-        """Pre-compute gate type information."""
+        """Pre-compute gate type information"""
         self.single_qubit_gates = {"H", "S", "HS", "SH", "HSH"}
-        self.two_qubit_gates = {"CNOT"}
+        self.two_qubit_gates = {"CNOT"} #, "SWAP"}
         
     def _precompute_gate_indices(self):
-        """Pre-compute gate indices for GPU operations."""
+        """Pre-compute gate indices for GPU operations"""
+        # Create mappings from gate names to indices
         self.gate_name_to_idx = {
             "H": 0, "S": 1, "HS": 2, "SH": 3, "HSH": 4,
             "CNOT": 5, "terminal": 6
         }
         
+        # Create tensors for fast GPU lookups
         self.action_gate_types = torch.zeros(self.num_actions, dtype=torch.long)
         self.action_qubit1 = torch.zeros(self.num_actions, dtype=torch.long)
-        self.action_qubit2 = torch.zeros(self.num_actions, dtype=torch.long) - 1
+        self.action_qubit2 = torch.zeros(self.num_actions, dtype=torch.long) - 1  # -1 for single qubit gates
         
         for idx, action in self.action_mapping.items():
             gate_name = action[0]
             self.action_gate_types[idx] = self.gate_name_to_idx[gate_name]
+            
             if gate_name != "terminal":
                 self.action_qubit1[idx] = action[1]
-                if len(action) > 2:
+                if len(action) > 2:  # Two-qubit gate
                     self.action_qubit2[idx] = action[2]
         
+        # Move to device
         self.action_gate_types = self.action_gate_types.to(self.device)
         self.action_qubit1 = self.action_qubit1.to(self.device)
         self.action_qubit2 = self.action_qubit2.to(self.device)
         
+        # Create masks for gate types
         self.single_qubit_mask = torch.zeros(self.num_actions, dtype=torch.bool)
         self.two_qubit_mask = torch.zeros(self.num_actions, dtype=torch.bool)
         
@@ -473,6 +561,7 @@ class GFlowNet:
         self.single_qubit_mask = self.single_qubit_mask.to(self.device)
         self.two_qubit_mask = self.two_qubit_mask.to(self.device)
 
+        # Initialize MaskingEngine for efficient mask computation
         self.masking_engine = MaskingEngine(
             n_qubits=self.n_qubits,
             num_actions=self.num_actions,
@@ -488,7 +577,10 @@ class GFlowNet:
 
     def calculate_conservative_buffer_size(self, max_depth: int) -> int:
         """Calculate conservative upper bound for buffer size."""
+        # Worst case: all single-qubit gates (each qubit gets a gate at each layer)
         single_qubit_bound = self.n_qubits * max_depth
+        
+        # Add safety margin
         return int(self.conservative_multiplier * single_qubit_bound)
     
     def determine_buffer_size(self, max_depth: int) -> int:
@@ -520,20 +612,25 @@ class GFlowNet:
         """Fully vectorized action application with depth tracking."""
         batch_size, n_measurements = actions.shape
         
+        # GPU OPTIMIZATION: Double-buffered pre-allocation for safety + performance
+        # Alternating buffers ensures previous results survive at least one more call
         if (hasattr(trajectory_batch, '_terminated_buffers') and 
             trajectory_batch._terminated_buffers[0].shape == (batch_size, n_measurements)):
             idx = trajectory_batch._terminated_buffer_idx
-            trajectory_batch._terminated_buffer_idx = 1 - idx
+            trajectory_batch._terminated_buffer_idx = 1 - idx  # Alternate for next call
             terminated = trajectory_batch._terminated_buffers[idx].zero_()
         else:
             terminated = torch.zeros((batch_size, n_measurements), dtype=torch.bool, device=actions.device)
         
+        # Get active trajectories
         active_mask = trajectory_batch.active
         if not active_mask.any():
             return terminated
         
+        # Apply all gates in a single batched call
         batched_tableau.apply_actions_step(actions, self.action_mapping, active_mask)
         
+        # Create a 2D view for easier indexing
         flat_active = active_mask.view(-1)
         flat_actions = actions.view(-1)
         active_indices = flat_active.nonzero(as_tuple=True)[0]
@@ -541,18 +638,24 @@ class GFlowNet:
         if len(active_indices) == 0:
             return terminated
         
+        # Get active actions
         active_actions = flat_actions[active_indices]
+        
+        # Convert flat indices back to 2D indices
         batch_indices = active_indices // n_measurements
         meas_indices = active_indices % n_measurements
         
+        # Check for terminal actions
         is_terminal = active_actions == self.terminal_index
         if is_terminal.any():
             term_batch = batch_indices[is_terminal]
             term_meas = meas_indices[is_terminal]
             terminated[term_batch, term_meas] = True
             trajectory_batch.active[term_batch, term_meas] = False
+            # Update batched tableau active status
             batched_tableau.active[term_batch, term_meas] = False
         
+        # Process non-terminal actions
         non_terminal_mask = ~is_terminal
         if not non_terminal_mask.any():
             return terminated
@@ -561,62 +664,85 @@ class GFlowNet:
         nt_batch = batch_indices[non_terminal_mask]
         nt_meas = meas_indices[non_terminal_mask]
         
+        # Get gate types and qubits for all non-terminal actions
         gate_types = self.action_gate_types[nt_actions]
         qubit1 = self.action_qubit1[nt_actions]
         qubit2 = self.action_qubit2[nt_actions]
         
+        # Determine which actions are single vs two-qubit
         is_single = self.single_qubit_mask[nt_actions]
         is_two = self.two_qubit_mask[nt_actions]
+        
+        # Initialize needs_new_layer mask
         needs_new_layer = torch.zeros_like(non_terminal_mask)
         
+        # Check for single-qubit gates needing new layer
         if is_single.any():
             single_idx = is_single.nonzero(as_tuple=True)[0]
             single_batch = nt_batch[single_idx]
             single_meas = nt_meas[single_idx]
             single_q = qubit1[single_idx]
+            
+            # Vectorized check if qubit is already used in current layer
             already_used = trajectory_batch.current_layer_qubits[single_batch, single_meas, single_q]
             needs_new_layer[single_idx[already_used]] = True
         
+        # Check for two-qubit gates needing new layer
         if is_two.any():
             two_idx = is_two.nonzero(as_tuple=True)[0]
             two_batch = nt_batch[two_idx]
             two_meas = nt_meas[two_idx]
             two_q1 = qubit1[two_idx]
             two_q2 = qubit2[two_idx]
+            
+            # Check if either qubit is already used
             q1_used = trajectory_batch.current_layer_qubits[two_batch, two_meas, two_q1]
             q2_used = trajectory_batch.current_layer_qubits[two_batch, two_meas, two_q2]
             already_used = q1_used | q2_used
             needs_new_layer[two_idx[already_used]] = True
         
+        # Update depths for trajectories needing new layer
         if needs_new_layer.any():
             new_layer_idx = needs_new_layer.nonzero(as_tuple=True)[0]
             new_layer_batch = nt_batch[new_layer_idx]
             new_layer_meas = nt_meas[new_layer_idx]
+            
+            # Increment depth
             trajectory_batch.circuit_depths[new_layer_batch, new_layer_meas] += 1
+            
+            # Reset current layer qubits for these trajectories
             trajectory_batch.current_layer_qubits[new_layer_batch, new_layer_meas] = False
         
+        # Get current depths for all non-terminal trajectories
         current_depths = trajectory_batch.circuit_depths[nt_batch, nt_meas]
         
+        # Update qubit last use step if step is provided
         if step is not None:
+            # Update for single-qubit gates
             if is_single.any():
                 single_idx = is_single.nonzero(as_tuple=True)[0]
                 single_batch = nt_batch[single_idx]
                 single_meas = nt_meas[single_idx]
                 single_q = qubit1[single_idx]
+                
                 trajectory_batch.qubit_last_use_step[single_batch, single_meas, single_q] = step
                 trajectory_batch.action_qubits[single_batch, single_meas, step, 0] = single_q
             
+            # Update for two-qubit gates
             if is_two.any():
                 two_idx = is_two.nonzero(as_tuple=True)[0]
                 two_batch = nt_batch[two_idx]
                 two_meas = nt_meas[two_idx]
                 two_q1 = qubit1[two_idx]
                 two_q2 = qubit2[two_idx]
+                
+                # Update both qubits
                 trajectory_batch.qubit_last_use_step[two_batch, two_meas, two_q1] = step
                 trajectory_batch.qubit_last_use_step[two_batch, two_meas, two_q2] = step
                 trajectory_batch.action_qubits[two_batch, two_meas, step, 0] = two_q1
                 trajectory_batch.action_qubits[two_batch, two_meas, step, 1] = two_q2
         
+        # Update gate tracking for single-qubit gates
         if is_single.any():
             single_idx = is_single.nonzero(as_tuple=True)[0]
             single_batch = nt_batch[single_idx]
@@ -624,10 +750,17 @@ class GFlowNet:
             single_q = qubit1[single_idx]
             single_gate_types = gate_types[single_idx]
             single_depths = current_depths[single_idx]
+            
+            # Update last single qubit gates
             trajectory_batch.last_single_qubit_gates[single_batch, single_meas, single_q] = single_gate_types
+            
+            # Mark qubit as used in current layer
             trajectory_batch.current_layer_qubits[single_batch, single_meas, single_q] = True
+            
+            # Update last layer for this qubit
             trajectory_batch.qubit_last_layer[single_batch, single_meas, single_q] = single_depths
         
+        # Update gate tracking for two-qubit gates
         if is_two.any():
             two_idx = is_two.nonzero(as_tuple=True)[0]
             two_batch = nt_batch[two_idx]
@@ -636,12 +769,20 @@ class GFlowNet:
             two_q2 = qubit2[two_idx]
             two_gate_types = gate_types[two_idx]
             two_depths = current_depths[two_idx]
+            
+            # Update last two qubit gates (both directions)
             trajectory_batch.last_two_qubit_gates[two_batch, two_meas, two_q1, two_q2] = two_gate_types
             trajectory_batch.last_two_qubit_gates[two_batch, two_meas, two_q2, two_q1] = two_gate_types
+            
+            # Clear last single qubit gates for both qubits (allows single-qubit gates after two-qubit gates)
             trajectory_batch.last_single_qubit_gates[two_batch, two_meas, two_q1] = -1
             trajectory_batch.last_single_qubit_gates[two_batch, two_meas, two_q2] = -1
+            
+            # Mark both qubits as used in current layer
             trajectory_batch.current_layer_qubits[two_batch, two_meas, two_q1] = True
             trajectory_batch.current_layer_qubits[two_batch, two_meas, two_q2] = True
+            
+            # Update last layer for both qubits
             trajectory_batch.qubit_last_layer[two_batch, two_meas, two_q1] = two_depths
             trajectory_batch.qubit_last_layer[two_batch, two_meas, two_q2] = two_depths
         
@@ -667,6 +808,7 @@ class GFlowNet:
                      max_depth: Optional[int] = None,
                      compute_gradients: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute forward and backward flows with vectorized operations."""
+        # Check if we have cached states
         if trajectory_batch.cache_enabled and trajectory_batch.cached_states:
             return self.compute_flows_cached(
                 trajectory_batch, 
@@ -674,21 +816,25 @@ class GFlowNet:
                 compute_gradients=compute_gradients
             )
         
+        # Original flow computation (unchanged)
         batch_size = trajectory_batch.batch_size
         n_measurements = trajectory_batch.n_measurements
         max_length = trajectory_batch.max_length
         device = trajectory_batch.device
         
+        # GPU OPTIMIZATION: Double-buffered pre-allocation for safety + performance
+        # Alternating buffers ensures previous results survive at least one more call
         if (hasattr(trajectory_batch, '_forward_flows_buffers') and 
             trajectory_batch._forward_flows_buffers[0].shape == (batch_size, n_measurements)):
             idx = trajectory_batch._flow_buffer_idx
-            trajectory_batch._flow_buffer_idx = 1 - idx
+            trajectory_batch._flow_buffer_idx = 1 - idx  # Alternate for next call
             forward_flows = trajectory_batch._forward_flows_buffers[idx].zero_()
             backward_flows = trajectory_batch._backward_flows_buffers[idx].zero_()
         else:
             forward_flows = torch.zeros((batch_size, n_measurements), device=device)
             backward_flows = torch.zeros((batch_size, n_measurements), device=device)
         
+        # Create a new tableau for flow computation
         batched_tableau = CliffordMap(
             n_qubits=self.n_qubits,
             batch_size=batch_size,
@@ -696,6 +842,7 @@ class GFlowNet:
             device=str(device)
         )
         
+        # Create temporary batch for tracking state
         temp_batch = TrajectoryBatch(
             batch_size=batch_size,
             n_measurements=n_measurements,
@@ -707,10 +854,13 @@ class GFlowNet:
         temp_batch.lengths = trajectory_batch.lengths.clone()
         temp_batch.active = trajectory_batch.lengths > 0
         batched_tableau.active = temp_batch.active.clone()
+        
+        # Copy trajectory info for backward mask computation
         temp_batch.actions = trajectory_batch.actions.clone()
         temp_batch.qubit_last_use_step = trajectory_batch.qubit_last_use_step.clone()
         
         for step in range(max_length):
+            # Update active mask for this step
             step_active = step < trajectory_batch.lengths
             temp_batch.active = step_active
             batched_tableau.active = step_active
@@ -719,14 +869,17 @@ class GFlowNet:
             if states_tensor.shape[0] == 0:
                 break
             
+            # Compute logits
             if compute_gradients:
                 logits_f = self.pf_model(states_tensor)
             else:
                 with torch.no_grad():
                     logits_f = self.pf_model(states_tensor)
             
+            # Compute masks
             masks = self.compute_action_masks_gpu(temp_batch, max_depth)
             
+            # Convert indices to tensor for batch operations
             if isinstance(indices, list):
                 indices_tensor = torch.tensor(indices, dtype=torch.long, device=device)
             elif isinstance(indices, torch.Tensor):
@@ -734,6 +887,7 @@ class GFlowNet:
             else:
                 indices_tensor = torch.stack([torch.as_tensor(idx, device=device) for idx in indices])
             
+            # Get actions for this step and filter out trajectories that have ended
             step_actions = trajectory_batch.actions[indices_tensor[:, 0], indices_tensor[:, 1], step]
             valid_length_mask = step < trajectory_batch.lengths[indices_tensor[:, 0], indices_tensor[:, 1]]
             if not valid_length_mask.any():
@@ -741,6 +895,7 @@ class GFlowNet:
             indices_tensor = indices_tensor[valid_length_mask]
             step_actions = step_actions[valid_length_mask]
 
+            # Vectorized forward flows with action validity checks
             traj_masks = masks[indices_tensor[:, 0], indices_tensor[:, 1]]
             masked_logits_f = logits_f[valid_length_mask].masked_fill(~traj_masks, float('-inf'))
 
@@ -756,6 +911,7 @@ class GFlowNet:
             selected_f = selected_f * action_valid.float()
             forward_flows[indices_tensor[:, 0], indices_tensor[:, 1]] += selected_f
 
+            # Determine which trajectories will contribute to backward flows
             lengths_selected = trajectory_batch.lengths[indices_tensor[:, 0], indices_tensor[:, 1]]
             non_terminal = self.action_gate_types[step_actions] != self.gate_name_to_idx["terminal"]
             valid_backward = non_terminal & (step < lengths_selected - 1)
@@ -766,7 +922,9 @@ class GFlowNet:
                 b_indices = None
                 b_actions = None
             
+            # Apply actions for next step
             if step < max_length - 1:
+                # Prepare action tensor for applying current step actions
                 actions = torch.full((batch_size, n_measurements), self.terminal_index,
                                    dtype=torch.long, device=device)
 
@@ -785,6 +943,7 @@ class GFlowNet:
                             batched_tableau, actions, temp_batch, step=step
                         )
 
+                # After applying actions, compute backward probabilities
                 if b_indices is not None and b_indices.shape[0] > 0:
                     states_next, indices_next = batched_tableau.to_flat_tensors_active_only()
                     with torch.no_grad():
@@ -792,10 +951,12 @@ class GFlowNet:
                         if logits_b.dim() == 1:
                             logits_b = logits_b.unsqueeze(0).expand(states_next.shape[0], -1)
 
+                    # Use exposed-based backward masks
                     masks_next = self.compute_backward_masks_gpu(
                         temp_batch, current_step=step + 1, forward_masks=None
                     )
 
+                    # Get indices_next_tensor
                     if isinstance(indices_next, list):
                         indices_next_tensor = torch.tensor(indices_next, dtype=torch.long, device=device)
                     elif isinstance(indices_next, torch.Tensor):
@@ -803,9 +964,10 @@ class GFlowNet:
                     else:
                         indices_next_tensor = torch.stack([torch.as_tensor(idx, device=device) for idx in indices_next])
 
-                    b_exp = b_indices.unsqueeze(1)
-                    next_exp = indices_next_tensor.unsqueeze(0)
-                    matches = torch.all(b_exp == next_exp, dim=-1)
+                    # Vectorized mapping without dict or loops
+                    b_exp = b_indices.unsqueeze(1)  # (num_b, 1, 2)
+                    next_exp = indices_next_tensor.unsqueeze(0)  # (1, num_active, 2)
+                    matches = torch.all(b_exp == next_exp, dim=-1)  # (num_b, num_active)
                     valid_b_mask = torch.any(matches, dim=1)
                     if valid_b_mask.any():
                         mapped = torch.argmax(matches.float(), dim=1)[valid_b_mask]
@@ -822,6 +984,7 @@ class GFlowNet:
                                 masked_logits_b[valid_any_b], dim=-1
                             )
                         
+                        # Handle NaN/inf in backward log probs
                         log_probs_b = torch.nan_to_num(log_probs_b, nan=0.0, posinf=0.0, neginf=-20.0)
                         
                         selected_b = log_probs_b.gather(1, b_actions.unsqueeze(1)).squeeze(1)
@@ -846,34 +1009,46 @@ class GFlowNet:
         n_measurements = trajectory_batch.n_measurements
         device = trajectory_batch.device
         
+        # GPU OPTIMIZATION: Double-buffered pre-allocation for safety + performance
+        # Alternating buffers ensures previous results survive at least one more call
         if (hasattr(trajectory_batch, '_forward_flows_buffers') and 
             trajectory_batch._forward_flows_buffers[0].shape == (batch_size, n_measurements)):
             idx = trajectory_batch._flow_buffer_idx
-            trajectory_batch._flow_buffer_idx = 1 - idx
+            trajectory_batch._flow_buffer_idx = 1 - idx  # Alternate for next call
             forward_flows = trajectory_batch._forward_flows_buffers[idx].zero_()
             backward_flows = trajectory_batch._backward_flows_buffers[idx].zero_()
         else:
             forward_flows = torch.zeros((batch_size, n_measurements), device=device)
             backward_flows = torch.zeros((batch_size, n_measurements), device=device)
         
+        # Check if we have cached states
         if not trajectory_batch.cached_states:
             logging.warning("No cached states found in trajectory batch!")
+            #if debug_mode:
+            #    logging.warning("DEBUG: Trajectory batch info:")
+            #    logging.warning(f"  Cache enabled: {trajectory_batch.cache_enabled}")
+            #    logging.warning(f"  Max length: {trajectory_batch.max_length}")
+            #    logging.warning(f"  Lengths: {trajectory_batch.lengths}")
+            # Return zeros if no cached states
             return forward_flows, backward_flows
         
+        # Collect all states and actions for batched forward flow computation
         all_states = []
         all_indices = []
         all_actions = []
         all_masks = []
-        step_mapping = []
+        step_mapping = []  # Maps position in concatenated arrays to step number
         
+        # Gather all cached data
         for step, cached_data in enumerate(trajectory_batch.cached_states):
             if cached_data is None:
-                continue
+                continue  # Skip None entries instead of breaking
                 
             states_tensor, indices = cached_data
             if states_tensor.shape[0] == 0:
                 continue
                 
+            # Filter by trajectory length
             valid_mask = step < trajectory_batch.lengths[indices[:, 0], indices[:, 1]]
             
             if valid_mask.any():
@@ -882,6 +1057,7 @@ class GFlowNet:
                 valid_actions = trajectory_batch.actions[
                     valid_indices[:, 0], valid_indices[:, 1], step
                 ]
+                # Get masks - check if they're cached or need to be computed
                 if (hasattr(trajectory_batch, 'cached_masks') and 
                     trajectory_batch.cached_masks and 
                     step < len(trajectory_batch.cached_masks) and 
@@ -890,6 +1066,9 @@ class GFlowNet:
                         valid_indices[:, 0], valid_indices[:, 1]
                     ]
                 else:
+                    # Compute masks if not cached
+                    # For now, create all-true masks as a fallback
+                    # This ensures we don't crash but may not be ideal
                     valid_masks = torch.ones(
                         (valid_states.shape[0], self.num_actions), 
                         dtype=torch.bool, 
@@ -907,25 +1086,31 @@ class GFlowNet:
         if not all_states:
             return forward_flows, backward_flows
         
+        # Concatenate all states for batched processing
         concat_states = torch.cat(all_states, dim=0)
         concat_indices = torch.cat(all_indices, dim=0)
         concat_actions = torch.cat(all_actions, dim=0)
         concat_masks = torch.cat(all_masks, dim=0)
         
+        # Process in chunks to manage memory
         num_states = concat_states.shape[0]
         
+        # Batched forward flow computation
         all_log_probs_f = []
         for chunk_idx, i in enumerate(range(0, num_states, chunk_size)):
             chunk_end = min(i + chunk_size, num_states)
             chunk_states = concat_states[i:chunk_end]
             chunk_masks = concat_masks[i:chunk_end]
             
+            # Forward pass
             if compute_gradients:
                 logits_f = self.pf_model(chunk_states)
             else:
                 with torch.no_grad():
                     logits_f = self.pf_model(chunk_states)
             
+            
+            # Apply masks and compute log probs
             masked_logits_f = logits_f.masked_fill(~chunk_masks, float('-inf'))
             valid_any = torch.isfinite(masked_logits_f).any(dim=1)
             
@@ -935,35 +1120,52 @@ class GFlowNet:
             
             all_log_probs_f.append(log_probs_f)
         
+        # Concatenate results
         all_log_probs_f = torch.cat(all_log_probs_f, dim=0)
+        
+        # Extract action probabilities
         selected_log_probs = all_log_probs_f.gather(1, concat_actions.unsqueeze(1)).squeeze(1)
         
+        # CRITICAL FIX: Filter out -inf values that occur when replayed actions
+        # were valid during sampling but invalid during replay due to state differences
         valid_probs = torch.isfinite(selected_log_probs)
         if not valid_probs.all():
+            num_invalid = (~valid_probs).sum().item()
+            #if debug_mode:
+            #    logging.warning(f"Found {num_invalid} invalid log probs during replay. "
+            #                  "This happens when actions valid during sampling become invalid during replay.")
+            # Only use valid probabilities for flow computation
             valid_indices = valid_probs.nonzero(as_tuple=True)[0]
             selected_log_probs = selected_log_probs[valid_indices]
             concat_indices = concat_indices[valid_indices]
         
+        # Accumulate forward flows efficiently
+        # Use scatter_add for efficient accumulation
         flat_indices = concat_indices[:, 0] * n_measurements + concat_indices[:, 1]
         forward_flows_flat = torch.zeros(batch_size * n_measurements, device=device)
-        if len(selected_log_probs) > 0:
+        if len(selected_log_probs) > 0:  # Only scatter if we have valid probs
             forward_flows_flat.scatter_add_(0, flat_indices, selected_log_probs)
         forward_flows = forward_flows_flat.view(batch_size, n_measurements)
         
+        # For backward flows, use precomputed valid counts
         if trajectory_batch.cached_backward_valid_counts:
+            # Process backward flows using cached counts
             for step in range(len(trajectory_batch.cached_states) - 1):
                 if trajectory_batch.cached_states[step] is None:
                     continue
                 
+                # Get cached data for this step
                 states_tensor, indices = trajectory_batch.cached_states[step]
                 if states_tensor.shape[0] == 0:
                     continue
                 
+                # Get valid counts for next step
                 if trajectory_batch.cached_backward_valid_counts[step + 1] is None:
                     continue
                     
                 next_valid_counts = trajectory_batch.cached_backward_valid_counts[step + 1]
                 
+                # Filter trajectories that contribute to backward flow
                 valid_mask = step < trajectory_batch.lengths[indices[:, 0], indices[:, 1]]
                 if not valid_mask.any():
                     continue
@@ -971,6 +1173,7 @@ class GFlowNet:
                 valid_indices = indices[valid_mask]
                 step_actions = trajectory_batch.actions[valid_indices[:, 0], valid_indices[:, 1], step]
                 
+                # Check which will contribute to backward flow
                 lengths_selected = trajectory_batch.lengths[valid_indices[:, 0], valid_indices[:, 1]]
                 non_terminal = self.action_gate_types[step_actions] != self.gate_name_to_idx["terminal"]
                 valid_backward = non_terminal & (step < lengths_selected - 1)
@@ -979,9 +1182,18 @@ class GFlowNet:
                     continue
                 
                 b_indices = valid_indices[valid_backward]
+                b_actions = step_actions[valid_backward]
+                
+                # Get valid counts for these trajectories
                 b_valid_counts = next_valid_counts[b_indices[:, 0], b_indices[:, 1]]
+                
+                # Compute uniform log probabilities
+                # For uniform distribution: log(1/n) = -log(n)
+                # Avoid division by zero
                 b_valid_counts = b_valid_counts.clamp(min=1)
                 log_probs_uniform = -torch.log(b_valid_counts.float())
+                
+                # Add to backward flows
                 backward_flows[b_indices[:, 0], b_indices[:, 1]] += log_probs_uniform
         
         if self.debug:
@@ -1000,7 +1212,9 @@ class GFlowNet:
         assert costs.shape[0] == trajectory_batch.batch_size, \
             f"Costs shape {costs.shape} doesn't match batch size {trajectory_batch.batch_size}"
         
+        # Ensure costs are on the correct device
         costs = costs.to(self.device)
+        
         if max_depth is None:
             max_depth = getattr(self, "last_max_depth", None)
         
@@ -1015,11 +1229,13 @@ class GFlowNet:
         
         forward_flows, backward_flows = self.compute_flows(trajectory_batch, max_depth=max_depth, compute_gradients=True)
         
-        rewards = self.reward_fn(costs, beta=beta, **reward_kwargs)
+        rewards = self.reward_fn(costs, beta=beta, **reward_kwargs) # reward shape should match (batch_size, n_measurements)
         
+        # Check for NaN/Inf in rewards
         if torch.isnan(rewards).any() or torch.isinf(rewards).any():
             logging.warning(f"NaN/Inf detected in rewards! Costs stats: min={costs.min().item():.6f}, "
                           f"max={costs.max().item():.6f}, mean={costs.mean().item():.6f}")
+            logging.warning(f"Reward function: {self.reward_fn.__name__}, beta={beta}, reward_kwargs={reward_kwargs}")
         
         if self.debug:
             logging.debug(f"  Forward flows shape: {forward_flows.shape}, non-zero: {(forward_flows != 0).sum().item()}")
@@ -1029,9 +1245,12 @@ class GFlowNet:
         valid_mask = trajectory_batch.lengths > 0
         valid_counts = valid_mask.sum(dim=1)
         
+        #valid_counts should be as many as the number trajectories in each batch
         if self.debug:
             logging.debug(f"  Valid counts shape: {valid_counts.shape}, non-zero: {(valid_counts > 0).sum().item()}")
+            logging.debug(f"  Valid mask: {valid_mask.sum(dim=1)}")
         
+        # Vectorized averaging across valid trajectories
         valid_counts_clamped = valid_counts.clamp(min=1)
         mask_float = valid_mask.float()
         forward_flows_sum = (forward_flows * mask_float).sum(dim=1)
@@ -1053,6 +1272,7 @@ class GFlowNet:
                 logging.debug(f"  Backward flows avg: {backward_flows_avg.detach().cpu().numpy()}")
                 logging.debug(f"  Rewards: {rewards_filtered.detach().cpu().numpy()}")
             
+            # Get logZ if model has it
             logZ = self.pf_model.logZ if hasattr(self.pf_model, 'logZ') else torch.tensor(0.0, device=self.device)
             
             loss, objective_metrics = self.objective.compute_loss(
@@ -1063,8 +1283,12 @@ class GFlowNet:
             )
             
             if self.debug:
-                logging.debug(f"  Loss value: {loss.item()}, logZ value: {self.pf_model.logZ.item()}")
+                logging.debug(f"  Loss shape: {loss.shape if hasattr(loss, 'shape') else 'scalar'}")
+                logging.debug(f"  Loss value: {loss.item()}")
+                logging.debug(f"  logZ shape: {self.pf_model.logZ.shape}")
+                logging.debug(f"  logZ value: {self.pf_model.logZ.item()}")
             
+            # Compute metrics on GPU, transfer to CPU only once at the end
             metrics_tensors = {
                 'loss': loss.mean() if loss.dim() > 0 else loss,
                 'reward': rewards.mean(),
@@ -1072,12 +1296,16 @@ class GFlowNet:
                 'logZ': logZ.mean() if logZ.dim() > 0 else logZ,
                 'avg_trajectories_per_batch': valid_counts.float().mean()
             }
+            # Add objective_metrics
             for k, v in objective_metrics.items():
                 metrics_tensors[k] = v.mean() if torch.is_tensor(v) and v.dim() > 0 else v
             
+            # Single transfer to CPU
             metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in metrics_tensors.items()}
         else:
+            # Return zero loss with gradient
             zero_loss = torch.zeros(1, device=self.device, requires_grad=True).squeeze()
+            
             return zero_loss, {
                 'loss': 0.0,
                 'reward': 0.0,
@@ -1096,7 +1324,11 @@ class GFlowNet:
                           batch_data_list: Optional[List[Dict]] = None,
                           cache_for_flows: bool = True) -> TrajectoryBatch:
         """Sample trajectories with depth limit and adaptive buffer sizing."""
+
+        # Store max_depth for loss computation
         self.last_max_depth = max_depth
+
+        # Determine buffer size
         max_length = self.determine_buffer_size(max_depth)
         
         if self.debug or (self.adaptive_tracker and self.adaptive_tracker.update_count % 50 == 0):
@@ -1111,6 +1343,7 @@ class GFlowNet:
         if mode == SamplingMode.REPLAY:
             return self._replay_trajectories(batch_data_list, max_length)
         
+        # Create tableau on the same device as the model
         batched_tableau = CliffordMap(
             n_qubits=self.n_qubits,
             batch_size=batch_size,
@@ -1127,6 +1360,7 @@ class GFlowNet:
         )
         trajectory_batch.batched_tableau = batched_tableau
         
+        # Enable caching if requested
         if cache_for_flows:
             trajectory_batch.enable_caching()
         
@@ -1139,62 +1373,82 @@ class GFlowNet:
                 if states_tensor.shape[0] == 0:
                     break
 
+                # Ensure contiguous memory layout for GPU performance
                 if self.device.type in ['cuda', 'mps']:
                     states_tensor = states_tensor.contiguous()
 
+                # Compute masks
                 masks = self.compute_action_masks_gpu(trajectory_batch, max_depth)
                 
+                # If caching is enabled and we'll need backward flows, compute valid counts
                 backward_valid_counts = None
                 if cache_for_flows and step < max_length - 1:
+                    # Compute backward masks for the NEXT step
                     backward_masks = self.compute_backward_masks_gpu(
                         trajectory_batch, current_step=step + 1, forward_masks=None
                     )
+                    # Count valid actions (excluding terminal)
                     backward_masks[:, :, self.terminal_index] = False
                     backward_valid_counts = backward_masks.sum(dim=2)
                 
+                # Cache states if enabled
                 if cache_for_flows:
                     trajectory_batch.cache_step_data(
                         step, states_tensor, indices, masks, backward_valid_counts
                     )
                 
+                # Initialize actions with terminal
                 actions = torch.full((batch_size, n_measurements), self.terminal_index,
                                    dtype=torch.long, device=self.device)
                 
                 if mode == SamplingMode.ON_POLICY:
+                    # Pad input to fixed sizes for better CUDAGraph performance
                     if self.device.type == 'cuda' and states_tensor.shape[0] > 0:
+                        # Define fixed bucket sizes for padding
                         bucket_sizes = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
                         current_size = states_tensor.shape[0]
+
+                        # Find the smallest bucket that fits
                         padded_size = current_size
                         for bucket in bucket_sizes:
                             if current_size <= bucket:
                                 padded_size = bucket
                                 break
 
+                        # Pad if needed
                         if padded_size > current_size:
                             padding = padded_size - current_size
                             padding_tensor = torch.zeros(padding, states_tensor.shape[1],
                                                         dtype=states_tensor.dtype,
                                                         device=states_tensor.device)
                             padded_states = torch.cat([states_tensor, padding_tensor], dim=0)
+                            # Run model on padded input
                             padded_logits = self.pf_model(padded_states)
+                            # Extract only the valid outputs
                             logits = padded_logits[:current_size]
                         else:
                             logits = self.pf_model(states_tensor)
                     else:
                         logits = self.pf_model(states_tensor)
 
+                    # Ensure indices tensor on device
                     if isinstance(indices, torch.Tensor):
                         indices_tensor = indices.to(self.device)
                     else:
                         indices_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
 
+                    # Gather masks for active trajectories
                     active_masks = masks[indices_tensor[:, 0], indices_tensor[:, 1]]
+
+                    # Mask invalid actions with -inf
                     masked_logits = logits.clone()
                     masked_logits[~active_masks] = float('-inf')
 
+                    # Sample actions in batch
                     dist = Categorical(logits=masked_logits)
                     sampled_actions = dist.sample()
 
+                    # Handle degenerate cases with no valid actions
                     valid_any = torch.isfinite(masked_logits).any(dim=1)
                     sampled_actions = torch.where(
                         valid_any,
@@ -1202,16 +1456,20 @@ class GFlowNet:
                         torch.full_like(sampled_actions, self.terminal_index),
                     )
 
+                    # Write back sampled actions
                     actions[indices_tensor[:, 0], indices_tensor[:, 1]] = sampled_actions
                     trajectory_batch.actions[indices_tensor[:, 0], indices_tensor[:, 1], step] = sampled_actions
 
                 elif mode == SamplingMode.OFF_POLICY:
+                    # Ensure indices tensor on device
                     if isinstance(indices, torch.Tensor):
                         indices_tensor = indices.to(self.device)
                     else:
                         indices_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
 
                     active_masks = masks[indices_tensor[:, 0], indices_tensor[:, 1]]
+
+                    # Uniform logits over valid actions
                     off_logits = torch.zeros_like(active_masks, dtype=torch.float32)
                     off_logits[~active_masks] = float('-inf')
 
@@ -1221,15 +1479,18 @@ class GFlowNet:
                     actions[indices_tensor[:, 0], indices_tensor[:, 1]] = sampled_actions
                     trajectory_batch.actions[indices_tensor[:, 0], indices_tensor[:, 1], step] = sampled_actions
                 
+                # Apply actions using depth-aware function with step tracking
                 terminated = self.apply_actions_to_batch(
                     batched_tableau, actions, trajectory_batch, step=step
                 )
                 
+                # Update lengths for terminated trajectories
                 newly_terminated = terminated & (trajectory_batch.lengths == 0)
                 if newly_terminated.any():
                     terminated_indices = torch.nonzero(newly_terminated, as_tuple=False)
                     trajectory_batch.lengths[terminated_indices[:, 0], terminated_indices[:, 1]] = step + 1
                 
+                # Handle max length reached
                 if step == max_length - 1:
                     still_active = trajectory_batch.active & (trajectory_batch.lengths == 0)
                     if still_active.any():
@@ -1237,6 +1498,7 @@ class GFlowNet:
                         trajectory_batch.lengths[active_indices[:, 0], active_indices[:, 1]] = max_length
                         trajectory_batch.active[active_indices[:, 0], active_indices[:, 1]] = False
         
+        # Update adaptive statistics if using adaptive strategy
         if self.adaptive_tracker is not None:
             self.adaptive_tracker.update_statistics(trajectory_batch)
         
@@ -1279,23 +1541,28 @@ class GFlowNet:
         """Update top K batches buffer with minimal CPU transfer - based on lowest costs."""
         batch_size = trajectory_batch.batch_size
         
+        # Process each batch element
         for b_idx in range(batch_size):
-            batch_cost = costs[b_idx].item()
+            batch_cost = costs[b_idx].item()  # Single CPU transfer for cost
             
+            # Check if this batch has valid trajectories
             valid_mask = trajectory_batch.lengths[b_idx] > 0
             if not valid_mask.any():
                 continue
             
+            # Extract batch data (keep on GPU)
             batch_actions = trajectory_batch.actions[b_idx].clone()
             batch_lengths = trajectory_batch.lengths[b_idx].clone()
             
+            # Update top K list (keeping lowest costs)
             if len(self.top_trajectories_costs) < self.K:
                 self.top_trajectories_actions.append(batch_actions)
                 self.top_trajectories_lengths.append(batch_lengths)
                 self.top_trajectories_costs.append(batch_cost)
             else:
+                # Find maximum cost (worst trajectory)
                 max_cost = max(self.top_trajectories_costs)
-                if batch_cost < max_cost:
+                if batch_cost < max_cost:  # If new cost is lower, replace the worst
                     max_idx = self.top_trajectories_costs.index(max_cost)
                     self.top_trajectories_actions[max_idx] = batch_actions
                     self.top_trajectories_lengths[max_idx] = batch_lengths
@@ -1304,7 +1571,9 @@ class GFlowNet:
     def _replay_trajectories(self, batch_data_list: Optional[List[Dict]], 
                                      max_length: int) -> TrajectoryBatch:
         """Replay trajectories with minimal CPU-GPU transfer."""
+        # Use stored top trajectories
         if not hasattr(self, 'top_trajectories_actions') or not self.top_trajectories_actions:
+            # No stored trajectories, return empty batch
             return TrajectoryBatch(
                 batch_size=0,
                 n_measurements=1,
@@ -1315,9 +1584,14 @@ class GFlowNet:
         
         n_batches = len(self.top_trajectories_actions)
         batch_size = n_batches
+        
+        # Get n_measurements from stored data
         n_measurements = self.top_trajectories_actions[0].shape[0]
         
+        # CRITICAL: Ensure max_length is sufficient for all stored trajectories
+        # GPU OPTIMIZATION: Find maximum length across all stored trajectories in single operation
         if self.top_trajectories_lengths:
+            # Stack all lengths and find max in one GPU operation
             all_lengths_max = torch.stack([l.max() for l in self.top_trajectories_lengths]).max().item()
             actual_max_length = max(max_length, int(all_lengths_max))
         else:
@@ -1325,9 +1599,10 @@ class GFlowNet:
         
         if actual_max_length > max_length:
             if self.debug:
-                logging.info(f"Replay: Extending max_length from {max_length} to {actual_max_length}")
+                logging.info(f"Replay: Extending max_length from {max_length} to {actual_max_length} to avoid truncation")
             max_length = actual_max_length
         
+        # Create tableau on the same device as the model
         batched_tableau = CliffordMap(
             n_qubits=self.n_qubits,
             batch_size=batch_size,
@@ -1343,53 +1618,76 @@ class GFlowNet:
             device=self.device
         )
         trajectory_batch.batched_tableau = batched_tableau
+        
+        # Enable caching for flow computation
         trajectory_batch.enable_caching()
+        
+        # Initialize qubit_last_use_step to -1 (no qubit used yet)
+        # This is CRITICAL for correct mask computation during replay
         trajectory_batch.qubit_last_use_step.fill_(-1)
         
+        # Fill trajectories from stored GPU tensors
         for b_idx in range(batch_size):
             stored_actions = self.top_trajectories_actions[b_idx]
             stored_lengths = self.top_trajectories_lengths[b_idx]
             
+            # Copy to trajectory batch
             actual_max_length = min(max_length, stored_actions.shape[1])
             trajectory_batch.actions[b_idx, :, :actual_max_length] = stored_actions[:, :actual_max_length]
             trajectory_batch.lengths[b_idx] = torch.minimum(stored_lengths, 
                                                            torch.tensor(max_length, device=self.device))
+            
+            # Update active status
             trajectory_batch.active[b_idx] = stored_lengths > 0
         
+        # Apply all actions to reconstruct final states and compute depths, with caching
         with torch.no_grad():
             for step in range(max_length):
+                # Check if any trajectory is active at this step
                 step_active = step < trajectory_batch.lengths
                 if not step_active.any():
                     break
                 
+                # Get states for active trajectories
                 states_tensor, indices = batched_tableau.to_flat_tensors_active_only()
                 if states_tensor.shape[0] == 0:
                     break
                 
+                # Compute masks for caching
                 masks = self.compute_action_masks_gpu(trajectory_batch, max_depth=None)
                 
+                # Compute backward valid counts if needed for next step
                 backward_valid_counts = None
                 if step < max_length - 1:
+                    # Compute backward masks for the NEXT step
                     backward_masks = self.compute_backward_masks_gpu(
                         trajectory_batch, current_step=step + 1, forward_masks=None
                     )
+                    # Count valid actions (excluding terminal)
                     backward_masks[:, :, self.terminal_index] = False
                     backward_valid_counts = backward_masks.sum(dim=2)
                 
+                # Cache step data for flow computation
                 trajectory_batch.cache_step_data(
                     step, states_tensor, indices, masks, backward_valid_counts
                 )
                 
+                # Get actions for this step
                 actions = trajectory_batch.actions[:, :, step]
+                
+                # Apply actions using the same function with depth tracking
                 terminated = self.apply_actions_to_batch(
                     batched_tableau, actions, trajectory_batch, step=step
                 )
+                
+                # Update active status
                 trajectory_batch.active &= ~terminated
         
         return trajectory_batch
     
     def save_checkpoint(self, path: str, update: int, metrics: Dict):
         """Save model checkpoint including adaptive tracker state and async evaluation data."""
+        # Convert GPU tensors to CPU for saving in a format suitable for async evaluation
         top_trajectories_cpu = []
         if hasattr(self, 'top_trajectories_actions'):
             for i in range(len(self.top_trajectories_actions)):
@@ -1405,19 +1703,21 @@ class GFlowNet:
             'pb_model_state_dict': self.pb_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer is not None else None,
             'update': update,
-            'checkpoint_id': time.time(),
+            'checkpoint_id': time.time(),  # Add unique checkpoint ID for async coordination
             'top_trajectories': top_trajectories_cpu,
             'metrics': metrics,
             'model_type': self.model_type,
             'n_qubits': self.n_qubits,
             'num_actions': self.num_actions,
             'objective_type': self.objective_type,
-            'checkpoint_version': 'gpu_with_depth_async',
+            'checkpoint_version': 'gpu_with_depth_async',  # Updated version
             'buffer_strategy': self.buffer_strategy,
+            # Add essential data for evaluation without needing full GFN instance
             'action_mapping': self.action_mapping,
             'terminal_index': self.terminal_index,
         }
         
+        # Save adaptive tracker state if using adaptive strategy
         if self.adaptive_tracker is not None:
             checkpoint['adaptive_tracker_state'] = {
                 'gates_per_depth': dict(self.adaptive_tracker.gates_per_depth),
@@ -1426,19 +1726,21 @@ class GFlowNet:
                 'max_gates_seen': self.adaptive_tracker.max_gates_seen.cpu().item(),
                 'total_trajectories': self.adaptive_tracker.total_trajectories,
                 'update_count': self.adaptive_tracker.update_count,
-                'gate_counts': self.adaptive_tracker.gate_counts[:1000],
+                'gate_counts': self.adaptive_tracker.gate_counts[:1000],  # Save last 1000
             }
         
+        # Use atomic write to prevent corruption during concurrent access
         temp_path = path + '.tmp'
         torch.save(checkpoint, temp_path)
-        os.rename(temp_path, path)
+        os.rename(temp_path, path)  # Atomic on most filesystems
     
     def load_checkpoint(self, path: str) -> Tuple[int, Dict]:
         """Load model checkpoint and restore adaptive tracker state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         if checkpoint.get('n_qubits') != self.n_qubits:
-            logging.info(f"Qubit mismatch: checkpoint has {checkpoint.get('n_qubits')}, model has {self.n_qubits}")
+            logging.info(f"Qubit mismatch: checkpoint has {checkpoint.get('n_qubits')}, "
+                  f"model has {self.n_qubits}")
             return 0, {}
         
         try:
@@ -1447,6 +1749,7 @@ class GFlowNet:
             if self.optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             
+            # Load top trajectories back to GPU
             self.top_trajectories_actions = []
             self.top_trajectories_lengths = []
             self.top_trajectories_costs = []
@@ -1457,10 +1760,13 @@ class GFlowNet:
                     self.top_trajectories_lengths.append(traj_data['lengths'].to(self.device))
                     self.top_trajectories_costs.append(traj_data['cost'])
             
+            # Restore adaptive tracker state if present
             if 'adaptive_tracker_state' in checkpoint and self.buffer_strategy == 'adaptive':
                 tracker_state = checkpoint['adaptive_tracker_state']
                 
+                # Initialize tracker if not already done
                 if self.adaptive_tracker is None:
+                    # Use a dummy max_depth for initialization
                     initial_size = self.calculate_conservative_buffer_size(10)
                     self.adaptive_tracker = AdaptiveBufferTracker(
                         initial_buffer_size=initial_size,
@@ -1468,6 +1774,7 @@ class GFlowNet:
                         warmup_updates=self.adaptive_warmup
                     )
                 
+                # Restore state
                 self.adaptive_tracker.gates_per_depth = defaultdict(list, tracker_state['gates_per_depth'])
                 self.adaptive_tracker.buffer_utilization = tracker_state['buffer_utilization']
                 self.adaptive_tracker.depth_distribution = defaultdict(int, tracker_state['depth_distribution'])
@@ -1477,6 +1784,7 @@ class GFlowNet:
                 self.adaptive_tracker.total_trajectories = tracker_state['total_trajectories']
                 self.adaptive_tracker.update_count = tracker_state['update_count']
                 self.adaptive_tracker.gate_counts = tracker_state['gate_counts']
+                
                 logging.info(f"Restored adaptive tracker state: {self.adaptive_tracker.update_count} updates")
 
             return checkpoint['update'], checkpoint.get('metrics', {})
@@ -1508,13 +1816,16 @@ class EfficientGFNTrainer:
         self.n_measurements = self.training_config["n_measurements"]
         self.update_freq = self.training_config["update_freq"]
         
+        # Initialize cost computer
         cost_config = self.training_config.get("cost", {})
         cost_type = cost_config.get("type", "exponential")
-        normalization_type = cost_config.get("normalization_type", "sum")
+        normalization_type = cost_config.get("normalization_type", "sum")  # 'sum' or 'max'
         
+        # Extract cost_kwargs - these are passed to compute_batch_cost
         self.cost_kwargs = {k: v for k, v in cost_config.items() 
                            if k not in ("type", "custom_costs", "normalization_type")}
         
+        # Check for legacy epsilon parameter
         if "epsilon" in self.training_config and "epsilon" not in self.cost_kwargs:
             self.cost_kwargs["epsilon"] = self.training_config["epsilon"]
         
@@ -1522,17 +1833,20 @@ class EfficientGFNTrainer:
             cost_type=cost_type,
             n_measurements=self.n_measurements,
             device=self.device,
-            normalize_weights=True,
-            normalization_type=normalization_type,
+            normalize_weights=True,  # Normalize weights for cost computation (excludes identity)
+            normalization_type=normalization_type,  # 'sum' (default) or 'max'
             pauli_strings=self.pauli_str_list,
             n_qubits=self.n_qubits
         )
         
+        # Add custom cost functions if specified
         if "custom_costs" in cost_config:
             for name, custom_cost_config in cost_config["custom_costs"].items():
                 if name == "threshold":
                     threshold = custom_cost_config.get("threshold", 0.5)
-                    self.cost_computer.add_custom_cost_function(name, ThresholdCost(threshold))
+                    self.cost_computer.add_custom_cost_function(
+                        name, ThresholdCost(threshold)
+                    )
         
         self.gfn = GFlowNet(
             n_qubits=self.n_qubits,

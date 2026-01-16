@@ -9,6 +9,7 @@ import numpy as np
 from typing import Tuple, List, Dict, Optional
 from pathlib import Path
 from collections import defaultdict
+from qiskit.quantum_info import SparsePauliOp
 
 
 class HamiltonianLoader:
@@ -49,6 +50,33 @@ class HamiltonianLoader:
             )
         
         return self.load_from_json(ham_path)
+    def load_hub_square_U2(self):
+        possible_paths = [
+            self.data_dir / "training_hyperparameters_square_U2.json",
+            Path("quantum_hardware_exp/data/training_hyperparameters_square_U2.json"),
+            Path("data/training_hyperparameters_square_U2.json"),
+        ]
+        ham_path = None
+        for path in possible_paths:
+            if path.exists():
+                ham_path = path
+                break
+        with open(path, 'r') as f:
+            data = json.load(f)
+        Ham = SparsePauliOp(data['gfn_config']['quantum']['pauli_str_list'], data['gfn_config']['quantum']['w_list'])
+        return Ham
+    
+    def format_spo(self, spo: SparsePauliOp):
+        paulis = spo.paulis.to_labels()
+        coeffs = spo.coeffs
+        if 'I' * spo.num_qubits in paulis:
+            id_idx = paulis.index('I' * spo.num_qubits)
+            cI = coeffs[id_idx]
+            paulis.pop(id_idx)
+            coeffs.pop(id_idx)
+        else:
+            cI = 0
+        return paulis, coeffs, cI
     
     def load_from_json(self, filepath: Path) -> Tuple[float, List[str], List[float]]:
         """

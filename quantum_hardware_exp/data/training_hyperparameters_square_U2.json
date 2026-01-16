@@ -1,0 +1,101 @@
+{
+  "actual_device": "cuda",
+  "num_actions": 55,
+  "state_dim": 272,
+  "action_mapping_size": 55,
+  "gfn_config": {
+    "model": {
+      "model_type": "clifford_mlp",
+      "hidden_dim": 1024,
+      "num_hidden_layers": 2,
+      "lr": 0.001,
+      "weight_decay": 1e-09,
+      "model_dir": "results_hubbard/Hubbard_Square2x2_U2_8qubits/experiment_20251110_150137",
+      "model_kwargs": {},
+      "objective_type": "tb",
+      "objective_kwargs": {
+        "loss_type": "squared"
+      },
+      "debug": false
+    },
+    "training": {
+      "beta": 100.0,
+      "n_measurements": 1000,
+      "update_freq": 50,
+      "max_depth": 4,
+      "K": 10,
+      "reward_kwargs": {
+        "alpha": 1.0
+      },
+      "cost": {
+        "type": "linear_bias",
+        "epsilon": 0.9
+      }
+    },
+    "quantum": {
+      "pauli_str_list": [
+        "IIIIIYZY",
+        "IIIIIXZX",
+        "IIIYZZZY",
+        "IIIXZZZX",
+        "IYZYIIII",
+        "IXZXIIII",
+        "IYZZZYII",
+        "IXZZZXII",
+        "IIIIYZYI",
+        "IIIIXZXI",
+        "IIYZZZYI",
+        "IIXZZZXI",
+        "YZYIIIII",
+        "XZXIIIII",
+        "YZZZYIII",
+        "XZZZXIII",
+        "IIIIIIZI",
+        "IIIIIIIZ",
+        "IIIIIIZZ",
+        "IIIIZIII",
+        "IIIIIZII",
+        "IIIIZZII",
+        "IIZIIIII",
+        "IIIZIIII",
+        "IIZZIIII",
+        "ZIIIIIII",
+        "IZIIIIII",
+        "ZZIIIIII"
+      ],
+      "w_list": [
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  "weights_loaded_from": null,
+  "energy_estimator": "EnergyEstimator with batched Clifford map",
+  "async_eval_enabled": true
+}

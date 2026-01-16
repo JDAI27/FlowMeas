@@ -9,6 +9,11 @@ from pathlib import Path
 from qiskit import QuantumCircuit
 from qiskit.circuit.library import StatePreparation
 from qiskit.quantum_info import Statevector
+from qiskit.circuit.library import StatePreparation, TwoLocal
+from qiskit.quantum_info import Statevector, SparsePauliOp
+from scipy.optimize import minimize
+import pickle
+from qiskit.circuit.library import real_amplitudes
 
 
 class StatePreparator:
@@ -22,6 +27,21 @@ class StatePreparator:
             cache_dir: Directory containing cached ground states
         """
         self.cache_dir = Path(cache_dir)
+
+    def load_ground_state_hub_2x2_U2(self):
+        possible_paths = [
+            Path("data/hub_res.pkl"),
+            Path("quantum_hardware_exp/data/hub_res.pkl"),
+            Path("data/hub_res.pkl"),
+        ]
+        state_path = None
+        for path in possible_paths:
+            if path.exists():
+                state_path = path
+                break
+        with open(state_path, 'rb') as file:
+            qc = pickle.load(file)
+        return qc
     
     def load_ground_state(
         self, 

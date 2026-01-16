@@ -16,9 +16,9 @@ from qiskit.quantum_info import SparsePauliOp
 from quantum_hardware_exp.hamiltonian_loader import HamiltonianLoader
 from quantum_hardware_exp.state_preparation import StatePreparator
 from quantum_hardware_exp.circuits.dss_loader import load_circuits_from_checkpoint
-from quantum_hardware_exp.runner.snapshot_runner import run_snapshots_simulator, run_snapshots_ibm
+from quantum_hardware_exp.runner.snapshot_runner import run_snapshots_simulator, run_snapshots_ibm, run_snapshots_estimator
 from quantum_hardware_exp.estimation.dss_estimator import estimate_energy
-
+from qiskit_ibm_runtime.options import TwirlingOptions, SamplerOptions
 
 def _truncate_or_repeat(circuits: List, N: int) -> List:
     if len(circuits) >= N:
@@ -195,7 +195,7 @@ def estimate_energy_estimator(
 def main():
     ap = argparse.ArgumentParser(description="DSS-style comparison runner (Flow-Shadow vs Qiskit baseline)")
     ap.add_argument("--budget", type=int, default=1000, help="Snapshot budget N (one bitstring per circuit)")
-    ap.add_argument("--checkpoint", type=Path, default=Path("quantum_hardware_exp/data/checkpoint_h2_8q.pth"))
+    ap.add_argument("--checkpoint", type=Path, default=Path("quantum_hardware_exp/data/checkpoint_square_U2.pth"))
     ap.add_argument("--backend", type=str, default=None, help="IBM backend name for hardware; omit for simulator")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--repeats", type=int, default=1, help="Repeat full N-snapshot run K times for statistics")
@@ -204,11 +204,14 @@ def main():
 
     # Load H2 Hamiltonian and ansatz
     loader = HamiltonianLoader()
-    cI, paulis, coeffs = loader.load_h2_8qubit()
+    #cI, paulis, coeffs = loader.load_h2_8qubit()
     prep = StatePreparator()
-    state, true_E = prep.load_ground_state("H2", 8)
-    ansatz = prep.create_state_preparation_circuit(state, 8)
-
+    #state, true_E = prep.load_ground_state("H2", 8)
+    #ansatz = prep.create_state_preparation_circuit(state, 8)
+    Ham = loader.load_hub_square_U2()
+    ansatz = prep.load_ground_state_hub_2x2_U2()
+    paulis, coeffs, cI = loader.format_spo(Ham)
+    true_E = -4.202672114583806
     # Flow-Shadow circuits
     fs_circuits, n = load_circuits_from_checkpoint(str(args.checkpoint))
     fs_sched = _truncate_or_repeat(fs_circuits, args.budget)
@@ -220,18 +223,22 @@ def main():
     # Execute snapshots (with repeats for statistics)
     fs_energies: List[float] = []
     qk_energies: List[float] = []
+    qk_estim_energies: List[float] = []
+    if args.backend or args.recover:
+        from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2, Session, EstimatorV2
+        svc = QiskitRuntimeService()
     if args.backend:
-        from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
-        svc = QiskitRuntimeService(channel="ibm_quantum")
         backend = svc.backend(args.backend)
-        sampler = SamplerV2(backend=backend)
-        estimator = _initialize_ibm_estimator(backend, args.budget)
-        for r in range(args.repeats):
-            fs_bits = run_snapshots_ibm(ansatz, fs_sched, sampler)
-            fs_E, _ = estimate_energy(fs_bits, fs_sched, paulis, coeffs, cI)
-            qk_E = estimate_energy_estimator(estimator, ansatz, paulis, coeffs, cI)
-            fs_energies.append(fs_E)
-            qk_energies.append(qk_E)
+        with Session(backend=backend) as session:
+            sampler = SamplerV2(session)
+            for r in range(args.repeats):
+                fs_bits = run_snapshots_ibm(ansatz, fs_sched, sampler, backend)
+                qk_bits = run_snapshots_ibm(ansatz, qk_sched, sampler, backend)
+                fs_E, _ = estimate_energy(fs_bits, fs_sched, paulis, coeffs, cI)
+                qk_E, _ = estimate_energy(qk_bits, qk_sched, paulis, coeffs, cI)
+                fs_energies.append(fs_E)
+                qk_energies.append(qk_E)
+            qk_estim_energies = run_snapshots_estimator(ansatz, Ham, args.repeats, args.budget, session, backend)
     else:
         for r in range(args.repeats):
             fs_bits = run_snapshots_simulator(ansatz, fs_sched, seed=args.seed + r)
@@ -243,12 +250,15 @@ def main():
 
     fs_E = float(np.mean(fs_energies))
     qk_E = float(np.mean(qk_energies))
+    qk_estim_E = float(np.mean(qk_estim_energies))
     fs_std = float(np.std(fs_energies, ddof=1)) if len(fs_energies) > 1 else 0.0
     qk_std = float(np.std(qk_energies, ddof=1)) if len(qk_energies) > 1 else 0.0
+    qk_estim_std = float(np.std(qk_estim_energies, ddof=1)) if len(qk_estim_energies) > 1 else 0.0
     def ci95(std, n):
         return 1.96 * std / np.sqrt(n) if n > 1 else 0.0
     fs_ci = ci95(fs_std, len(fs_energies))
     qk_ci = ci95(qk_std, len(qk_energies))
+    qk_estim_ci = ci95(qk_estim_std, len(qk_estim_energies))
 
     # Report
     print("\n" + "=" * 70)
@@ -259,6 +269,7 @@ def main():
     print("-" * 70)
     print(f"Flow-Shadow: mean {fs_E:+.6f} Ha  (std {fs_std:.6f}, CI95 ±{fs_ci:.6f})  | err {abs(fs_E-true_E):.6f}")
     print(f"Qiskit Base: mean {qk_E:+.6f} Ha  (std {qk_std:.6f}, CI95 ±{qk_ci:.6f})  | err {abs(qk_E-true_E):.6f}")
+    print(f"Qiskit Estim Base: mean {qk_estim_E:+.6f} Ha  (std {qk_estim_std:.6f}, CI95 ±{qk_estim_ci:.6f})  | err {abs(qk_estim_E-true_E):.6f}")
     impr = (abs(qk_E-true_E) - abs(fs_E-true_E)) / max(1e-12, abs(qk_E-true_E))
     print("-" * 70)
     print(f"Relative improvement: {impr*100:.2f}%")

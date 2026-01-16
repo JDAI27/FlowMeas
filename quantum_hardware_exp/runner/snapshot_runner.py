@@ -9,8 +9,23 @@ from __future__ import annotations
 from typing import List, Tuple
 
 from qiskit import QuantumCircuit
-from qiskit.quantum_info import Statevector
+from qiskit.quantum_info import Statevector, SparsePauliOp
+from qiskit.transpiler import generate_preset_pass_manager
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2, Session, EstimatorV2
+import numpy as np
 
+def run_snapshots_estimator(ansatz: QuantumCircuit, obs: SparsePauliOp, reps: int, total_shots_per_rep: int, session, backend):
+    pm = generate_preset_pass_manager(optimization_level = 3, backend = backend)
+    num_cliques = len(obs.paulis.group_qubit_wise_commuting())
+    estimator = EstimatorV2(session, options = {'default_shots': np.ceil(total_shots_per_rep / num_cliques), 'resilience_level' : 1})
+    energies = []
+    isa_qc = pm.run(ansatz)
+    isa_obs = obs.apply_layout(isa_qc.layout)
+
+    for _ in range(reps):
+        res = estimator.run([(isa_qc, isa_obs)])
+        energies.append(res.result()[0].data.evs)
+    return energies
 
 def run_snapshots_simulator(ansatz: QuantumCircuit, circuits: List[QuantumCircuit], seed: int = 42) -> List[str]:
     """Run one snapshot per circuit on a statevector simulator and return bitstrings."""
@@ -32,7 +47,7 @@ def run_snapshots_simulator(ansatz: QuantumCircuit, circuits: List[QuantumCircui
     return out
 
 
-def run_snapshots_ibm(ansatz: QuantumCircuit, circuits: List[QuantumCircuit], sampler, seed: int | None = None) -> List[str]:
+def run_snapshots_ibm(ansatz: QuantumCircuit, circuits: List[QuantumCircuit], sampler, backend, seed: int | None = None) -> List[str]:
     """Run one snapshot per circuit on IBM Sampler-like primitive and return bitstrings.
 
     - If the primitive supports shots, we request shots=1 and read counts.
@@ -40,7 +55,7 @@ def run_snapshots_ibm(ansatz: QuantumCircuit, circuits: List[QuantumCircuit], sa
     """
     from typing import List, Dict
     import numpy as np
-
+    pm = generate_preset_pass_manager(optimization_level = 3, backend = backend)
     # Build measured circuits (compose ansatz and circuit, then measure)
     measured: List[QuantumCircuit] = []
     for u in circuits:
@@ -49,7 +64,8 @@ def run_snapshots_ibm(ansatz: QuantumCircuit, circuits: List[QuantumCircuit], sa
         qc.compose(ansatz, inplace=True)
         qc.compose(u, inplace=True)
         qc.measure_all()
-        measured.append(qc)
+        isa_qc = pm.run(qc)
+        measured.append(isa_qc)
 
     # Try run with shots=1; if not supported, fall back
     try:

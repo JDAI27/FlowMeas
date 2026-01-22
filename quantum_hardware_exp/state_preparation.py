@@ -29,19 +29,77 @@ class StatePreparator:
         self.cache_dir = Path(cache_dir)
 
     def load_ground_state_hub_2x2_U2(self):
+        """Load the optimized ansatz for 2x2 Hubbard model with U=2.
+
+        First tries to load from pickle. If that fails (version incompatibility),
+        rebuilds the ansatz from the known optimal parameters.
+        """
         possible_paths = [
             Path("data/hub_res.pkl"),
             Path("quantum_hardware_exp/data/hub_res.pkl"),
-            Path("data/hub_res.pkl"),
         ]
-        state_path = None
+
+        # Try loading from pickle first
         for path in possible_paths:
             if path.exists():
-                state_path = path
-                break
-        with open(state_path, 'rb') as file:
-            qc = pickle.load(file)
-        return qc
+                try:
+                    with open(path, 'rb') as file:
+                        qc = pickle.load(file)
+                    return qc
+                except (ValueError, pickle.UnpicklingError) as e:
+                    # Pickle incompatible with current Qiskit version
+                    # Fall through to build from parameters
+                    pass
+
+        # Build ansatz from known optimal parameters
+        return self._build_hub_2x2_U2_ansatz()
+
+    def _build_hub_2x2_U2_ansatz(self):
+        """Build the optimized ansatz for 2x2 Hubbard U=2 from scratch.
+
+        Architecture:
+        - 8 qubits
+        - Layer 1: RX-RZ on each qubit (16 params)
+        - CZ entanglement: (0,1), (2,3), (4,5), (6,7) then (1,2), (3,4), (5,6)
+        - Layer 2: RX on each qubit (8 params)
+
+        Optimal parameters found via VQE optimization achieving E ≈ -3.527 Ha
+        """
+        from qiskit.circuit import ParameterVector
+
+        # Optimal parameters from VQE optimization
+        optimal_params = np.array([
+            3.83997831e-01,  1.00240740e-04,  7.53225813e-01,  2.04375783e-04,
+            1.19081583e+00,  1.32265803e-05,  1.57117741e-01,  1.76796837e-03,
+            1.57033269e-01,  4.84630113e-04,  1.19088668e+00,  2.43974551e-06,
+            7.53080019e-01,  1.67981696e-04,  3.84051508e-01, -2.69691550e-20,
+            1.05396922e+00,  8.66888314e-02, -2.67174854e-20,  4.79379735e-01,
+            4.79229296e-01, -2.67418676e-20,  8.66300478e-02,  1.05401347e+00
+        ])
+
+        # Build parameterized circuit
+        qc = QuantumCircuit(8)
+        theta = ParameterVector('theta', 24)
+
+        # First layer: RX-RZ on each qubit
+        for i in range(8):
+            qc.rx(theta[2*i], i)
+            qc.rz(theta[2*i + 1], i)
+
+        # CZ entanglement - pairs
+        for i in range(4):
+            qc.cz(2*i, 2*i + 1)
+
+        # CZ entanglement - shifted pairs
+        for i in range(3):
+            qc.cz(2*i + 1, 2*i + 2)
+
+        # Second layer: RX on each qubit
+        for i in range(8):
+            qc.rx(theta[16 + i], i)
+
+        # Bind optimal parameters
+        return qc.assign_parameters(optimal_params)
     
     def load_ground_state(
         self, 

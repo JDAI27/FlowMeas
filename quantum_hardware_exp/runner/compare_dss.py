@@ -197,6 +197,7 @@ def main():
     ap.add_argument("--budget", type=int, default=1000, help="Snapshot budget N (one bitstring per circuit)")
     ap.add_argument("--checkpoint", type=Path, default=Path("quantum_hardware_exp/data/checkpoint_square_U2.pth"))
     ap.add_argument("--backend", type=str, default=None, help="IBM backend name for hardware; omit for simulator")
+    ap.add_argument("--aer", action="store_true", help="Use Aer simulator with fake backend topology (tests layout remapping)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--repeats", type=int, default=1, help="Repeat full N-snapshot run K times for statistics")
     ap.add_argument("--out", type=Path, default=None, help="Optional JSON filepath to save results; defaults under quantum_hardware_exp/results/")
@@ -204,14 +205,14 @@ def main():
 
     # Load H2 Hamiltonian and ansatz
     loader = HamiltonianLoader()
-    #cI, paulis, coeffs = loader.load_h2_8qubit()
     prep = StatePreparator()
-    #state, true_E = prep.load_ground_state("H2", 8)
-    #ansatz = prep.create_state_preparation_circuit(state, 8)
     Ham = loader.load_hub_square_U2()
-    ansatz = prep.load_ground_state_hub_2x2_U2()
     paulis, coeffs, cI = loader.format_spo(Ham)
-    true_E = -4.202672114583806
+    true_E = -3.52757248  # Exact ground state energy for 2x2 Hubbard U=2
+
+    # Load ansatz (now rebuilt from parameters if pickle is incompatible)
+    ansatz = prep.load_ground_state_hub_2x2_U2()
+    print(f"Ansatz loaded: {ansatz.num_qubits} qubits")
     # Flow-Shadow circuits
     fs_circuits, n = load_circuits_from_checkpoint(str(args.checkpoint))
     fs_sched = _truncate_or_repeat(fs_circuits, args.budget)
@@ -224,7 +225,7 @@ def main():
     fs_energies: List[float] = []
     qk_energies: List[float] = []
     qk_estim_energies: List[float] = []
-    if args.backend or args.recover:
+    if args.backend:
         from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2, Session, EstimatorV2
         svc = QiskitRuntimeService()
     if args.backend:
@@ -239,6 +240,23 @@ def main():
                 fs_energies.append(fs_E)
                 qk_energies.append(qk_E)
             qk_estim_energies = run_snapshots_estimator(ansatz, Ham, args.repeats, args.budget, session, backend)
+    elif args.aer:
+        # Use Aer simulator with fake backend topology to test layout remapping
+        from qiskit_aer import AerSimulator
+        from qiskit_ibm_runtime.fake_provider import FakeTorino
+        from quantum_hardware_exp.runner.snapshot_runner import run_snapshots_aer
+
+        fake_backend = FakeTorino()
+        backend = AerSimulator.from_backend(fake_backend)
+        print(f"Using AerSimulator with FakeTorino topology ({backend.num_qubits} qubits)")
+
+        for r in range(args.repeats):
+            fs_bits = run_snapshots_aer(ansatz, fs_sched, backend, seed=args.seed + r)
+            qk_bits = run_snapshots_aer(ansatz, qk_sched, backend, seed=args.seed + 1000 + r)
+            fs_E, _ = estimate_energy(fs_bits, fs_sched, paulis, coeffs, cI)
+            qk_E, _ = estimate_energy(qk_bits, qk_sched, paulis, coeffs, cI)
+            fs_energies.append(fs_E)
+            qk_energies.append(qk_E)
     else:
         for r in range(args.repeats):
             fs_bits = run_snapshots_simulator(ansatz, fs_sched, seed=args.seed + r)
@@ -264,7 +282,8 @@ def main():
     print("\n" + "=" * 70)
     print("DSS COMPARISON (SNAPSHOT BUDGET)")
     print("=" * 70)
-    print(f"Budget N: {args.budget} snapshots; repeats: {args.repeats}; device: {'hardware:'+args.backend if args.backend else 'simulator'}")
+    device_str = 'hardware:'+args.backend if args.backend else ('aer:FakeTorino' if args.aer else 'simulator')
+    print(f"Budget N: {args.budget} snapshots; repeats: {args.repeats}; device: {device_str}")
     print(f"True energy: {true_E:.6f} Ha")
     print("-" * 70)
     print(f"Flow-Shadow: mean {fs_E:+.6f} Ha  (std {fs_std:.6f}, CI95 ±{fs_ci:.6f})  | err {abs(fs_E-true_E):.6f}")

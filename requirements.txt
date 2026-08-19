@@ -1,0 +1,29 @@
+# FlowMeas — base (CPU) requirements.
+#
+# Python >= 3.10 (CI runs 3.10).
+#
+# This covers everything in code/ except the optional GPU tableau backend,
+# which has its own file (see requirements-measurement-adapter.txt).
+#
+# Every entry below is imported by code/; there are no unused pins.
+
+# Core numerics / training
+torch
+numpy>=2.0
+scipy
+psutil
+
+# Required by pauli_mpo_dmrg.py via torch.backends.opt_einsum. Without it the
+# 5-operand dense-boundary einsum falls back to a naive contraction order that
+# materializes a chi^4*d^4 tensor (~64 GiB at chi=128), so the module raises at
+# import rather than OOM mid-sweep.
+opt_einsum
+
+# Quantum chemistry and Hamiltonian construction
+pyscf>=2.3.0
+openfermion>=1.5.1
+qiskit-nature
+
+# Tensor-network DMRG reference states (large-system benchmarks)
+quimb
+physics-tenpy==1.1.0

@@ -1,0 +1,19 @@
+# Optional GPU requirements for code/measurement_adapter/.
+#
+# The base requirements.txt covers the CPU path. These add the GPU
+# dependencies the batched tableau backend uses at runtime.
+#
+# NOTE: the batched Clifford-tableau core (`clifford_tableau`) that this
+# adapter binds to is **to be announced shortly** and is therefore not
+# declared here. Until it is released, `code/measurement_adapter/` resolves
+# it lazily and FlowMeas falls back to the bundled PyTorch tableau path in
+# `code/clifford_map.py`; nothing in this repository requires it.
+#
+# CuPy must match your local CUDA toolkit version. Pick ONE:
+#   cupy-cuda12x>=14.0    # CUDA 12.x toolkits (default; tested at 14.0.1)
+#   cupy-cuda11x>=12.0    # CUDA 11.x toolkits
+cupy-cuda12x>=14.0
+
+# Optional: cuTensorNet-backed MPS estimator path
+# (code/measurement_adapter/mps_native_cutensornet.py).
+# cuquantum-python>=24.03
